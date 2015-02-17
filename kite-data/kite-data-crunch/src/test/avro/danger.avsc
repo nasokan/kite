@@ -1,0 +1,16 @@
+{
+  "namespace": "org.kite.test",
+  "type": "record",
+  "name": "Danger",
+  "fields": [
+    {
+      "type": "string",
+      "name": "username"
+    },
+    {
+      "type": ["null", "string"],
+      "name": "email",
+      "default": null
+    }
+  ]
+}

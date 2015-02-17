@@ -1,0 +1,15 @@
+{
+  "namespace": "org.kite.test",
+  "type": "record",
+  "name": "User",
+  "fields": [
+    {
+      "type": "string",
+      "name": "username"
+    },
+    {
+      "type": "string",
+      "name": "email"
+    }
+  ]
+}

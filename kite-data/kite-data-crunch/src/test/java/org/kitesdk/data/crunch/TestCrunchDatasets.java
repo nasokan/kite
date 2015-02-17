@@ -15,18 +15,36 @@
  */
 package org.kitesdk.data.crunch;
 
-import com.google.common.io.Files;
+import static org.junit.Assert.fail;
+import static org.kitesdk.data.spi.filesystem.DatasetTestUtilities.USER_SCHEMA;
+import static org.kitesdk.data.spi.filesystem.DatasetTestUtilities.checkTestUsers;
+import static org.kitesdk.data.spi.filesystem.DatasetTestUtilities.datasetSize;
+import static org.kitesdk.data.spi.filesystem.DatasetTestUtilities.writeTestUsers;
+
 import java.io.IOException;
 import java.net.URI;
 import java.util.Arrays;
 import java.util.Collection;
+
+import org.apache.avro.Schema;
+import org.apache.avro.file.DataFileWriter;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericData.Record;
+import org.apache.avro.generic.GenericDatumWriter;
+import org.apache.avro.generic.GenericRecord;
+import org.apache.avro.io.DatumWriter;
 import org.apache.crunch.CrunchRuntimeException;
+import org.apache.crunch.MapFn;
 import org.apache.crunch.PCollection;
 import org.apache.crunch.Pipeline;
+import org.apache.crunch.PipelineExecution.Status;
+import org.apache.crunch.PipelineResult;
 import org.apache.crunch.Target;
 import org.apache.crunch.impl.mr.MRPipeline;
+import org.apache.crunch.io.From;
+import org.apache.crunch.io.To;
+import org.apache.crunch.types.avro.Avros;
+import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.junit.After;
@@ -35,23 +53,23 @@ import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
+import org.kite.test.Danger;
+import org.kite.test.User;
 import org.kitesdk.data.Dataset;
 import org.kitesdk.data.DatasetDescriptor;
 import org.kitesdk.data.Datasets;
 import org.kitesdk.data.Formats;
 import org.kitesdk.data.MiniDFSTest;
-import org.kitesdk.data.spi.PartitionKey;
 import org.kitesdk.data.PartitionStrategy;
-import org.kitesdk.data.spi.DatasetRepository;
-import org.kitesdk.data.spi.PartitionedDataset;
-import org.kitesdk.data.View;
-import org.kitesdk.data.spi.LastModifiedAccessor;
 import org.kitesdk.data.URIBuilder;
+import org.kitesdk.data.View;
+import org.kitesdk.data.spi.DatasetRepository;
+import org.kitesdk.data.spi.LastModifiedAccessor;
+import org.kitesdk.data.spi.PartitionKey;
+import org.kitesdk.data.spi.PartitionedDataset;
 
-import static org.kitesdk.data.spi.filesystem.DatasetTestUtilities.USER_SCHEMA;
-import static org.kitesdk.data.spi.filesystem.DatasetTestUtilities.checkTestUsers;
-import static org.kitesdk.data.spi.filesystem.DatasetTestUtilities.datasetSize;
-import static org.kitesdk.data.spi.filesystem.DatasetTestUtilities.writeTestUsers;
+import com.google.common.collect.Lists;
+import com.google.common.io.Files;
 
 @RunWith(Parameterized.class)
 public abstract class TestCrunchDatasets extends MiniDFSTest {
@@ -110,6 +128,259 @@ public abstract class TestCrunchDatasets extends MiniDFSTest {
     checkTestUsers(outputDataset, 10);
   }
 
+  @Test
+  public void testSchemaEvolutionAddingFieldToReader() throws IOException {
+	  
+	// Begin PHASE-1
+	    // create user object and save it to HDFS
+	    String newSchemaAsString = "{"
+	    		  + "\"type\": \"record\"," 
+	    		  + "\"name\": \"Danger\","
+	    		  + "\"fields\": ["
+	    		  + " {"
+	    		  + "  \"type\": \"string\","
+	    		  + "    \"name\": \"username\""
+	    		  + " }"
+	    		  + "]"
+	    		  + "}";
+	    Schema newSchmea = new Schema.Parser().parse(newSchemaAsString);
+	 // create the dataset 
+	    Dataset outputDataset = repo.create("ns", "out", new DatasetDescriptor.Builder()
+	    .schema(newSchmea).build());
+	    GenericRecord user2 = new GenericData.Record(newSchmea);
+	    user2.put("username", "user2");
+	    DatumWriter<GenericRecord> userDatumWriter = new GenericDatumWriter<GenericRecord>();
+	    DataFileWriter<GenericRecord> dataFileWriter = new DataFileWriter<GenericRecord>(userDatumWriter);
+	    Path usersPath = new Path(testDirectory + "/user/users.avro");
+	    FSDataOutputStream fsDataOutputStream = fileSystem.create(usersPath);
+	    dataFileWriter.create(user2.getSchema(), fsDataOutputStream);
+	    dataFileWriter.append(user2);
+	    dataFileWriter.close();
+	    fsDataOutputStream.close();
+	    
+	    Pipeline pipeline = new MRPipeline(TestCrunchDatasets.class);
+	    // PCollection of user object
+	    PCollection<Record> users = pipeline.read(From.avroFile(usersPath, Avros.generics(newSchmea)));
+	    // materialize to see if read operation returns some data
+	    System.out.println("FIRST: " + Lists.newArrayList(users.materialize()));
+	    // write output as crunch dataset
+	    pipeline.write(users, CrunchDatasets.asTarget(outputDataset));
+	    PipelineResult res = pipeline.run();
+	    if (res == null || res.status == Status.FAILED || res.status== Status.KILLED)
+	    	fail("PHASE-1 FAILURE");
+	    
+	    // read data from updated dataset that has the new schema. At this point, User class has the old schema
+	    PCollection<Danger> data = pipeline.read(CrunchDatasets.asSource(outputDataset.getUri(), Danger.class));
+
+	    // materialize to see if read operation returns some data
+	    System.out.println("FINAL RESULT: " + Lists.newArrayList(data.materialize()));
+	    // write the outputs
+	    pipeline.write(data,To.avroFile(testDirectory + "/test/data/out"));
+	    res = pipeline.run();
+	    if (res == null || res.status == Status.FAILED || res.status== Status.KILLED)
+	    	fail("PHASE-2 FAILURE");
+	    
+	    System.out.println("DONE");
+  }
+  
+  @Test
+  public void testSchemaEvolutionRemovingFieldFromReader() throws IOException {
+	// Begin PHASE-1
+	    // create user object and save it to HDFS
+	    String newSchemaAsString = "{"
+	    		  + "\"type\": \"record\"," 
+	    		  + "\"name\": \"Danger\","
+	    		  + "\"fields\": ["
+	    		  + " {"
+	    		  + "  \"type\": \"string\","
+	    		  + "    \"name\": \"username\""
+	    		  + " },"
+	    		  + " {"
+	    		  + "  \"type\": [\"null\", \"long\"],"
+	    		  + "  \"name\": \"rank\","
+	    		  + "  \"default\": null"
+	    		  + " },"
+	    		  + " {"
+	    		  + "  \"type\": [\"null\", \"string\"],"
+	    		  + "  \"name\": \"email\","
+	    		  + "  \"default\": null"
+	    		  + " }"
+	    		  + "]"
+	    		  + "}";
+	    Schema newSchmea = new Schema.Parser().parse(newSchemaAsString);
+	 // create the dataset 
+	    Dataset outputDataset = repo.create("ns", "out", new DatasetDescriptor.Builder()
+	    .schema(newSchmea).build());
+	    GenericRecord user = new GenericData.Record(newSchmea);
+	    user.put("username", "user-name");
+	    user.put("rank", 100L);
+	    user.put("email", "newEmail@email.com");
+	    DatumWriter<GenericRecord> userDatumWriter = new GenericDatumWriter<GenericRecord>();
+	    DataFileWriter<GenericRecord> dataFileWriter = new DataFileWriter<GenericRecord>(userDatumWriter);
+	    Path usersPath = new Path(testDirectory + "/user/users.avro");
+	    FSDataOutputStream fsDataOutputStream = fileSystem.create(usersPath);
+	    dataFileWriter.create(user.getSchema(), fsDataOutputStream);
+	    dataFileWriter.append(user);
+	    dataFileWriter.close();
+	    fsDataOutputStream.close();
+	    
+	    Pipeline pipeline = new MRPipeline(TestCrunchDatasets.class);
+	    // PCollection of user object
+	    PCollection<Record> users = pipeline.read(From.avroFile(usersPath, Avros.generics(newSchmea)));
+	    // materialize to see if read operation returns some data
+	    System.out.println("FIRST: " + Lists.newArrayList(users.materialize()));
+	    // write output as crunch dataset
+	    pipeline.write(users, CrunchDatasets.asTarget(outputDataset));
+	    PipelineResult res = pipeline.run();
+	    if (res == null || res.status == Status.FAILED || res.status== Status.KILLED)
+	    	fail("PHASE-1 FAILURE");
+	    
+	    // read data from updated dataset that has the new schema. At this point, User class has the old schema
+	    PCollection<Danger> data = pipeline.read(CrunchDatasets.asSource(outputDataset.getUri(), Danger.class));
+
+
+	    // materialize to see if read operation returns some data
+	    System.out.println("FINAL RESULT: " + Lists.newArrayList(data.materialize()));
+	    // write the outputs
+	    pipeline.write(data,To.avroFile(testDirectory + "/test/data/out"));
+	    res = pipeline.run();
+	    if (res == null || res.status == Status.FAILED || res.status== Status.KILLED)
+	    	fail("PHASE-2 FAILURE");
+	    
+	    System.out.println("DONE");
+  }
+  
+  @Test
+  public void testSchemaEvolutionRemovingFieldFromReaderRegardlessOfPosition() throws IOException {
+	// Begin PHASE-1
+	    // create user object and save it to HDFS
+	    String newSchemaAsString = "{"
+	    		  + "\"type\": \"record\"," 
+	    		  + "\"name\": \"Danger\","
+	    		  + "\"fields\": ["
+	    		  + " {"
+	    		  + "  \"type\": \"string\","
+	    		  + "    \"name\": \"username\""
+	    		  + " },"
+	    		  + " {"
+	    		  + "  \"type\": [\"null\", \"string\"],"
+	    		  + "  \"name\": \"email\","
+	    		  + "  \"default\": null"
+	    		  + " },"
+	    		  + " {"
+	    		  + "  \"type\": [\"null\", \"long\"],"
+	    		  + "  \"name\": \"rank\","
+	    		  + "  \"default\": null"
+	    		  + " }"
+	    		  + "]"
+	    		  + "}";
+	    Schema newSchmea = new Schema.Parser().parse(newSchemaAsString);
+	 // create the dataset 
+	    Dataset outputDataset = repo.create("ns", "out", new DatasetDescriptor.Builder()
+	    .schema(newSchmea).build());
+	    GenericRecord user = new GenericData.Record(newSchmea);
+	    user.put("username", "user-name");
+	    user.put("rank", 100L);
+	    user.put("email", "newEmail@email.com");
+	    DatumWriter<GenericRecord> userDatumWriter = new GenericDatumWriter<GenericRecord>();
+	    DataFileWriter<GenericRecord> dataFileWriter = new DataFileWriter<GenericRecord>(userDatumWriter);
+	    Path usersPath = new Path(testDirectory + "/user/users.avro");
+	    FSDataOutputStream fsDataOutputStream = fileSystem.create(usersPath);
+	    dataFileWriter.create(user.getSchema(), fsDataOutputStream);
+	    dataFileWriter.append(user);
+	    dataFileWriter.close();
+	    fsDataOutputStream.close();
+	    
+	    Pipeline pipeline = new MRPipeline(TestCrunchDatasets.class);
+	    // PCollection of user object
+	    PCollection<Record> users = pipeline.read(From.avroFile(usersPath, Avros.generics(newSchmea)));
+	    // materialize to see if read operation returns some data
+	    System.out.println("FIRST: " + Lists.newArrayList(users.materialize()));
+	    // write output as crunch dataset
+	    pipeline.write(users, CrunchDatasets.asTarget(outputDataset));
+	    PipelineResult res = pipeline.run();
+	    if (res == null || res.status == Status.FAILED || res.status== Status.KILLED)
+	    	fail("PHASE-1 FAILURE");
+	    
+	    // read data from updated dataset that has the new schema. At this point, User class has the old schema
+	    PCollection<Danger> data = pipeline.read(CrunchDatasets.asSource(outputDataset.getUri(), Danger.class));
+
+	    // materialize to see if read operation returns some data
+	    System.out.println("FINAL RESULT: " + Lists.newArrayList(data.materialize()));
+	    // write the outputs
+	    pipeline.write(data,To.avroFile(testDirectory + "/test/data/out"));
+	    res = pipeline.run();
+	    if (res == null || res.status == Status.FAILED || res.status== Status.KILLED)
+	    	fail("PHASE-2 FAILURE");
+	    
+	    System.out.println("DONE");
+  }
+  
+  @Test
+  public void testSchemaEvolutionRemovingFieldFromReaderRegardlessOfPositionUser() throws IOException {
+	// Begin PHASE-1
+	    // create user object and save it to HDFS
+	    String newSchemaAsString = "{"
+	    		  + "\"type\": \"record\"," 
+	    		  + "\"name\": \"User\","
+	    		  + "\"fields\": ["
+	    		  + " {"
+	    		  + "  \"type\": \"string\","
+	    		  + "    \"name\": \"username\""
+	    		  + " },"
+	    		  + " {"
+	    		  + "  \"type\": [\"null\", \"long\"],"
+	    		  + "  \"name\": \"rank\","
+	    		  + "  \"default\": null"
+	    		  + " },"
+	    		  + " {"
+	    		  + "  \"type\": \"string\","
+	    		  + "  \"name\": \"email\""
+	    		  + " }"
+	    		  + "]"
+	    		  + "}";
+	    Schema newSchmea = new Schema.Parser().parse(newSchemaAsString);
+	 // create the dataset 
+	    Dataset outputDataset = repo.create("ns", "out", new DatasetDescriptor.Builder()
+	    .schema(newSchmea).build());
+	    GenericRecord user = new GenericData.Record(newSchmea);
+	    user.put("username", "user-name");
+	    user.put("rank", 100L);
+	    user.put("email", "newEmail@email.com");
+	    DatumWriter<GenericRecord> userDatumWriter = new GenericDatumWriter<GenericRecord>();
+	    DataFileWriter<GenericRecord> dataFileWriter = new DataFileWriter<GenericRecord>(userDatumWriter);
+	    Path usersPath = new Path(testDirectory + "/user/users.avro");
+	    FSDataOutputStream fsDataOutputStream = fileSystem.create(usersPath);
+	    dataFileWriter.create(user.getSchema(), fsDataOutputStream);
+	    dataFileWriter.append(user);
+	    dataFileWriter.close();
+	    fsDataOutputStream.close();
+	    
+	    Pipeline pipeline = new MRPipeline(TestCrunchDatasets.class);
+	    // PCollection of user object
+	    PCollection<Record> users = pipeline.read(From.avroFile(usersPath, Avros.generics(newSchmea)));
+	    // materialize to see if read operation returns some data
+	    System.out.println("FIRST: " + Lists.newArrayList(users.materialize()));
+	    // write output as crunch dataset
+	    pipeline.write(users, CrunchDatasets.asTarget(outputDataset));
+	    PipelineResult res = pipeline.run();
+	    if (res == null || res.status == Status.FAILED || res.status== Status.KILLED)
+	    	fail("PHASE-1 FAILURE");
+	    
+	    // read data from updated dataset that has the new schema. At this point, User class has the old schema
+	    PCollection<User> data = pipeline.read(CrunchDatasets.asSource(outputDataset.getUri(), User.class));
+
+	    // materialize to see if read operation returns some data
+	    System.out.println("FINAL RESULT: " + Lists.newArrayList(data.materialize()));
+	    // write the outputs
+	    pipeline.write(data,To.avroFile(testDirectory + "/test/data/out"));
+	    res = pipeline.run();
+	    if (res == null || res.status == Status.FAILED || res.status== Status.KILLED)
+	    	fail("PHASE-2 FAILURE");
+	    
+	    System.out.println("DONE");
+  }
+  
   @Test
   public void testGenericParquet() throws IOException {
     Dataset<Record> inputDataset = repo.create("ns", "in", new DatasetDescriptor.Builder()
